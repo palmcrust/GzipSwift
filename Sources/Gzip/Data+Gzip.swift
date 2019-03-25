@@ -162,11 +162,19 @@ extension Data {
             return Data()
         }
 
-        let contiguousData = self.withUnsafeBytes { Data(bytes: $0, count: self.count) }
-        var stream = contiguousData.createZStream()
-        var status: Int32
+        // There is no longer need to create contiguous data in a separate step, as createZStream
+        // does that. For safety, I'll keep the code commented out
+//         #if swift(>=5)
+//             let contiguousData = self.withUnsafeBytes( { (_ bytes: UnsafeRawBufferPointer) in
+//                 Data(bytes.bindMemory(to: Bytef.self)) })
+//         #else
+//             let contiguousData = self.withUnsafeBytes { Data(bytes: $0, count: self.count) }
+//         #endif
+//      var stream = contiguousData.createZStream()
         
-        status = deflateInit2_(&stream, level.rawValue, Z_DEFLATED, MAX_WBITS + 16, MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY, ZLIB_VERSION, Int32(DataSize.stream))
+        var stream = createZStream()
+
+        var status: Int32 = deflateInit2_(&stream, level.rawValue, Z_DEFLATED, MAX_WBITS + 16, MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY, ZLIB_VERSION, Int32(DataSize.stream))
         
         guard status == Z_OK else {
             // deflateInit2 returns:
@@ -176,22 +184,41 @@ extension Data {
             
             throw GzipError(code: status, msg: stream.msg)
         }
-        
-        var data = Data(capacity: DataSize.chunk)
-        while stream.avail_out == 0 {
+     
+        // Zipped file is supposed to be smaller, therefore current size should be enough to fit the output
+        var data = Data(capacity: self.count)
+     
+        while status == Z_OK && stream.avail_out == 0 {
             if Int(stream.total_out) >= data.count {
-                data.count += DataSize.chunk
+                // In case zipped file is actually bigger than original (which may happen according
+                // to Pigeonhole principle) incrementing by half-size should be sufficient 
+                data.count += self.count >> 1
             }
-            
-            data.withUnsafeMutableBytes { (bytes: UnsafeMutablePointer<Bytef>) in
-                stream.next_out = bytes.advanced(by: Int(stream.total_out))
+   
+         #if swift(>=5)
+            stream.next_out = data.withUnsafeMutableBytes { (buffer: UnsafeMutableRawBufferPointer) in
+                buffer.baseAddress!.assumingMemoryBound(to: Bytef.self).advanced(by: Int(stream.total_out))
             }
+         #else
+            stream.next_out = data.withUnsafeMutableBytes { (bytes: UnsafeMutablePointer<Bytef>) in
+               bytes.advanced(by: Int(stream.total_out))
+            }
+        #endif       
+
             stream.avail_out = uInt(data.count) - uInt(stream.total_out)
             
-            deflate(&stream, Z_FINISH)
+            status = deflate(&stream, Z_FINISH)
         }
         
-        deflateEnd(&stream)
+        guard [Z_OK, Z_STREAM_END].contains(status) else {
+            throw GzipError(code: status, msg: stream.msg)
+        }
+        
+        status = deflateEnd(&stream)
+        guard status == Z_OK else {
+            throw GzipError(code: status, msg: stream.msg)
+        } 
+        
         data.count = Int(stream.total_out)
         
         return data
@@ -209,11 +236,19 @@ extension Data {
             return Data()
         }
 
-        let contiguousData = self.withUnsafeBytes { Data(bytes: $0, count: self.count) }
-        var stream = contiguousData.createZStream()
-        var status: Int32
-        
-        status = inflateInit2_(&stream, MAX_WBITS + 32, ZLIB_VERSION, Int32(DataSize.stream))
+     
+// There is no longer need to create contiguous data in a separate step, as createZStream
+// does that. For safety, I'll keep the code commented out
+//         #if swift(>=5)
+//             let contiguousData = self.withUnsafeBytes( { (_ bytes: UnsafeRawBufferPointer) in
+//                 Data(bytes.bindMemory(to: Bytef.self)) })
+//         #else
+//             let contiguousData = self.withUnsafeBytes { Data(bytes: $0, count: self.count) }
+//         #endif
+//        var stream = contiguousData.createZStream()
+
+        var stream = self.createZStream()
+        var status: Int32 = inflateInit2_(&stream, MAX_WBITS + 32, ZLIB_VERSION, Int32(DataSize.stream))
         
         guard status == Z_OK else {
             // inflateInit2 returns:
@@ -224,23 +259,31 @@ extension Data {
             throw GzipError(code: status, msg: stream.msg)
         }
         
-        var data = Data(capacity: contiguousData.count * 2)
+        // This time we make the buffer twice the original size
+        var data = Data(capacity: self.count << 1)
         
         repeat {
             if Int(stream.total_out) >= data.count {
-                data.count += contiguousData.count / 2
+                data.count += self.count 
             }
             
-            data.withUnsafeMutableBytes { (bytes: UnsafeMutablePointer<Bytef>) in
-                stream.next_out = bytes.advanced(by: Int(stream.total_out))
+       #if swift (>=5)
+            stream.next_out = data.withUnsafeMutableBytes({(bytes: UnsafeMutableRawBufferPointer) in
+                bytes.baseAddress!.assumingMemoryBound(to: Bytef.self).advanced(by: Int(stream.total_out))
+            })
+        #else
+            stream.next_out = data.withUnsafeMutableBytes { (bytes: UnsafeMutablePointer<Bytef>) in
+                bytes.advanced(by: Int(stream.total_out))
             }
+        #endif
+         
             stream.avail_out = uInt(data.count) - uInt(stream.total_out)
             
             status = inflate(&stream, Z_SYNC_FLUSH)
             
         } while status == Z_OK
         
-        guard inflateEnd(&stream) == Z_OK && status == Z_STREAM_END else {
+        guard status == Z_STREAM_END else {
             // inflate returns:
             // Z_DATA_ERROR   The input data was corrupted (input stream not conforming to the zlib format or incorrect check value).
             // Z_STREAM_ERROR The stream structure was inconsistent (for example if next_in or next_out was NULL).
@@ -249,9 +292,15 @@ extension Data {
             
             throw GzipError(code: status, msg: stream.msg)
         }
+     
+        status = inflateEnd(&stream)
+     
+        guard status == Z_OK else {
+            throw GzipError(code: status, msg: stream.msg)
+        }
+     
         
         data.count = Int(stream.total_out)
-        
         return data
     }
     
@@ -260,9 +309,16 @@ extension Data {
         
         var stream = z_stream()
         
-        self.withUnsafeBytes { (bytes: UnsafePointer<Bytef>) in
-            stream.next_in = UnsafeMutablePointer<Bytef>(mutating: bytes)
+    #if swift(>=5)
+        stream.next_in = self.withUnsafeBytes {(bytes: UnsafeRawBufferPointer) in
+            UnsafeMutablePointer<Bytef>(mutating: bytes.baseAddress!.assumingMemoryBound(to: Bytef.self))
         }
+    #else
+        stream.next_in = self.withUnsafeBytes { (bytes: UnsafePointer<Bytef>) in
+            UnsafeMutablePointer<Bytef>(mutating: bytes)
+        }
+    #endif
+     
         stream.avail_in = uint(self.count)
         
         return stream
@@ -273,7 +329,7 @@ extension Data {
 
 private struct DataSize {
     
-    static let chunk = 2 ^ 14
+   // static let chunk = 2 ^ 14
     static let stream = MemoryLayout<z_stream>.size
     
     private init() { }
